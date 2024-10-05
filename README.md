@@ -1,6 +1,12 @@
 # Stable Diffusion
 *Stable Diffusion was made possible thanks to a collaboration with [Stability AI](https://stability.ai/) and [Runway](https://runwayml.com/) and builds upon our previous work:*
 
+## How to use
+1. https://huggingface.co/CompVis/stable-diffusion-v-1-4-original 여기서 sd-v1-4.ckpt를 다운로드 받음
+2. 저장한 ckpt파일 이름을 model.ckpt로 변경
+3. /models/ldm/stable-diffusion-v1 위치에 해당 ckpt를 넣음 (만약 stable-diffusion-v1 폴더가 없으면 생성)
+4. python scripts/txt2img.py --prompt "prompt 내용" 으로 실행 (자세한 내용은 아래 document를 통해 argument를 확인할 것)
+
 [**High-Resolution Image Synthesis with Latent Diffusion Models**](https://ommer-lab.com/research/latent-diffusion-models/)<br/>
 [Robin Rombach](https://github.com/rromb)\*,
 [Andreas Blattmann](https://github.com/ablattmann)\*,

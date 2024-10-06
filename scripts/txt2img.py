@@ -28,11 +28,17 @@ safety_model_id = "CompVis/stable-diffusion-safety-checker"
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
 safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
+# 중간 이미지 텐서를 저장하는 함수 추가
+def save_intermediate(intermediate, path, count):
+    torch.save(intermediate, os.path.join(path, f"intermediate_{count:05}.pt"))
+
+# 최종 이미지 텐서를 저장하는 함수 추가
+def save_final_tensor(tensor, path, count):
+    torch.save(tensor, os.path.join(path, f"final_{count:05}.pt"))
 
 def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
-
 
 def numpy_to_pil(images):
     """
@@ -309,7 +315,9 @@ def main():
                                                          unconditional_conditioning=uc,
                                                          eta=opt.ddim_eta,
                                                          x_T=start_code)
-
+                        # 중간 이미지 텐서를 저장
+                        save_intermediate(intermediate, sample_path, base_count)
+                        
                         x_samples_ddim = model.decode_first_stage(samples_ddim)
                         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                         x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
@@ -318,6 +326,9 @@ def main():
 
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
+                        # 최종 이미지 텐서를 저장
+                        save_final_tensor(x_checked_image_torch, sample_path, base_count)
+                        
                         if not opt.skip_save:
                             for x_sample in x_checked_image_torch:
                                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')

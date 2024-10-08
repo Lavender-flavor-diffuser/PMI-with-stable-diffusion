@@ -242,7 +242,7 @@ def main():
         "--log_every_t",
         type=int,
         help="determine the intermediate save period (Default : 100)",
-        detault=100
+        default=100
     )
     opt = parser.parse_args()
 

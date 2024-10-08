@@ -238,6 +238,12 @@ def main():
         choices=["full", "autocast"],
         default="autocast"
     )
+    parser.add_argument(
+        "--log_every_t",
+        type=int,
+        help="determine the intermediate save period (Default : 100)",
+        detault=100
+    )
     opt = parser.parse_args()
 
     if opt.laion400m:
@@ -314,7 +320,9 @@ def main():
                                                          unconditional_guidance_scale=opt.scale,
                                                          unconditional_conditioning=uc,
                                                          eta=opt.ddim_eta,
-                                                         x_T=start_code)
+                                                         x_T=start_code,
+                                                         log_every_t = opt.log_every_t
+                                                         )
                         
                         ## Decoding Latent Representations to Images (이전까지는 latent space 상에서의 tensor)
                         x_samples_ddim = model.decode_first_stage(samples_ddim)

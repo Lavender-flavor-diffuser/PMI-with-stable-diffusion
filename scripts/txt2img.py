@@ -337,7 +337,7 @@ def main():
                         intermediate_tensor = []
 
                         # Simulate a loop where tensors are generated
-                        for i in range(len(intermediate)):
+                        for i in range(len(intermediate['x_inter'])):
                             tensor = intermediate['x_inter'][i]
                             tensor_samples_ddim = model.decode_first_stage(tensor)
                             tensor_samples_ddim = torch.clamp((tensor_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)

@@ -141,6 +141,7 @@ optional arguments:
   --config CONFIG       path to config which constructs model
   --ckpt CKPT           path to checkpoint of model
   --seed SEED           the seed (for reproducible sampling)
+  --log_every_t         determine the intermediate save period (Default : 100)
   --precision {full,autocast}
                         evaluate at this precision
 ```

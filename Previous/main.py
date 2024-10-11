@@ -1,26 +1,23 @@
 import torch
-from diffusers import StableDiffusionPipeline
+import numpy as np
 import os
-import torch.nn as nn
+from DiffusionCondition import GaussianDiffusionSampler, GaussianDiffusionTrainer
+from ModelCondition import UNet
 
-model_id = "CompVis/stable-diffusion-v1-4"  # 원하는 모델 ID로 변경
-pipeline = StableDiffusionPipeline.from_pretrained(
-    model_id,
-    torch_dtype=torch.float16,
-    safety_checker=None
-).to("cuda")
+# Choose batch size
+batch_size = 100
+
+# Choose a label
+label = 1
+
+import torch
+import os
+import matplotlib.pyplot as plt
 
 def simulate_BM(x, gamma_list):
-    """
-    Simulate a single Brownian motion path.
+    # Given a data and list of snr, simulates a single Brownian motion path
+    # z_gamma = gamma * x + W_gamma, W_gamma ~ N(0, gamma)
 
-    Args:
-        x (torch.Tensor): Input data tensor.
-        gamma_list (torch.Tensor): List of SNR values.
-
-    Returns:
-        tuple: W_gamma, delta_W, z_gamma tensors.
-    """
     gamma_list = gamma_list.clone().detach().to(x.device)
     delta_gamma = torch.diff(gamma_list).to(x.device)
     delta_W = torch.randn((len(delta_gamma),) + x.shape, device=x.device) * torch.sqrt(delta_gamma).view(-1, 1, 1, 1).to(x.device)
@@ -29,171 +26,224 @@ def simulate_BM(x, gamma_list):
     z_gamma = gamma_list.view(-1, 1, 1, 1).to(x.device) * x + W_gamma
     return W_gamma, delta_W, z_gamma
 
-def get_intermediate_pointwise_mutual_info(img, label, model_num, t, w=1.0, pipeline=None):
-    """
-    Calculate the intermediate PMI using a pre-trained Stable Diffusion model.
 
-    Args:
-        img (torch.Tensor): Input image tensor.
-        label (int): Label for conditioning.
-        model_num (int): Model number identifier.
-        t (int): Intermediate timestep.
-        w (float, optional): Weight parameter. Defaults to 1.0.
-        pipeline (StableDiffusionPipeline): Loaded Stable Diffusion pipeline.
-
-    Returns:
-        tuple: Standard integral and total PMI values.
-    """
-    if pipeline is None:
-        raise ValueError("Stable Diffusion pipeline must be provided")
-
+def get_intermediate_pointwise_mutual_info(img, label, t, w=1.0):
     with torch.no_grad():
-        device = img.device
-        model = pipeline.unet  # Access the UNet component
+        # Load model
+        device = torch.device("cuda:0")
+        model = UNet(T=4000, num_labels=10, ch=128, ch_mult=[1, 2, 2, 2], num_res_blocks=2, dropout=0.15).to(device)
+        ckpt = torch.load(os.path.join("../data/", "ckpt_99_.pt"), map_location=device)
+        model.load_state_dict(ckpt)
         model.eval().to(device)
 
-        # Initialize integrals
+        # Initialize two terms
         standard_integral = 0.0
         ito_integral = 0.0
 
-        # DDPM parameters
-        betas = torch.linspace(1e-4, 0.028, 4000).double().to(device)
+        # Conventional notations used in DDPM paper
+        betas = torch.linspace(1e-4, 0.028, 4000).double()
         alphas = 1. - betas
         alphas_bar = torch.cumprod(alphas, dim=0).to(device)
 
-        # Compute alpha_bar from timestep t
+        # alpha bar calculated from t (intermediate timestep)
         alphas_bar_from_t = torch.cumprod(alphas[t:], dim=0).to(device)
-        # Signal-to-Noise Ratio (SNR)
+        # snr when we consider input at timestep t
         snrs = (alphas_bar_from_t / (1. - alphas_bar_from_t))
 
-        # Simulate Brownian Motion from timestep t
+        # Simulate BM from t taking account of new snr values above
         W_gamma, delta_Ws, z_gammas = simulate_BM(img, torch.flip(snrs, [0]))
         W_gamma = torch.flip(W_gamma, [0])
         delta_Ws = torch.flip(delta_Ws, [0])
-        delta_Ws = torch.cat((torch.zeros((1, *img.shape), device=device), delta_Ws), dim=0)
+        delta_Ws = torch.cat((torch.zeros((1, 3, 32, 32)).to(device), delta_Ws), dim=0)
         z_gammas = torch.flip(z_gammas, [0])
 
-        # Scale z_gamma to get x_t
+        # Scale z_gamma approriately to get x_t
         alphas_bar_from_t_reshaped = alphas_bar_from_t[:, None, None, None].to(torch.float32)
         z_gammas = z_gammas.to(torch.float32)
         x_ts = z_gammas * (1 - alphas_bar_from_t_reshaped) / torch.sqrt(alphas_bar_from_t_reshaped)
 
         size = 4000 - t
 
-        # Process in batches to limit memory usage
-        batch_size = 1000
-        for i in range((size - 1) // batch_size + 1):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size - 1, size - 1)
+        # Limit maximum batch size to 1000
+        for i in range((size-1)//1000+1):
+            # timestep t corresponds to index 0
+            start_idx = i*1000
+            end_idx = min((i+1)*1000-1, size - 1)
 
-            # Slice tensors appropriately
-            snr = snrs[start_idx:end_idx + 1]
-            x_t = x_ts[start_idx:end_idx + 1]
-            delta_W = delta_Ws[start_idx:end_idx + 1]
+            # Truncate appropriately
+            snr = snrs[start_idx:end_idx+1]
+            x_t = x_ts[start_idx:end_idx+1]
+            delta_W = delta_Ws[start_idx:end_idx+1]
 
             original_t_values = torch.arange(start_idx + t, end_idx + t + 1, 1).to(device)
 
-            # Prepare labels
-            labels_tensor = torch.full((end_idx - start_idx + 1,), label, dtype=torch.int).to(device)
+            labels = torch.full((end_idx - start_idx + 1,), label, dtype=torch.int).to(device)
 
-            # Inference with conditional UNet
-            # Stable Diffusion's UNet typically expects timestep embeddings
-            # and optional conditioning. Here, we'll assume label is used for conditioning.
-            
-            # Generate timestep embeddings
-            timesteps = original_t_values
-            # Note: Adjust the timestep embedding if necessary based on the model's implementation
-
-            # Forward pass (conditional)
-            # Ensure the UNet's forward method aligns with how it's called here
-            # For diffusers, UNet's forward might require additional parameters
-            # Adjust accordingly
-            # Example for diffusers' UNet:
-            # latent model expects inputs in the form (batch, channels, height, width)
-            # and timesteps as integers or embeddings
-
-            # Conditional prediction
-            # In diffusers, the UNet's forward method signature might look like:
-            # def forward(self, sample, timestep, encoder_hidden_states)
-            # Adjust based on actual implementation
-
-            # Here, we'll assume unconditional for simplicity
-            # Modify if you have a conditional setup
-            # If using classifier-free guidance, handle both conditional and unconditional passes
-
-            # Example for unconditional:
-            eps = model(x_t, timesteps).sample  # Replace with actual attribute/method
-            # If using conditional:
-            # concatenated_x = torch.cat([x_t, x_t], dim=0)
-            # concatenated_timesteps = torch.cat([timesteps, timesteps], dim=0)
-            # conditional_eps = model(concatenated_x, concatenated_timesteps).sample
-            # Assuming labels are handled inside the model or need to be concatenated similarly
-
-            # Placeholder for non-conditional prediction
-            nonEps = eps  # Replace with actual unconditional prediction if available
-
-            # Combine predictions
+            # Inference
+            eps = model(x_t, original_t_values, labels)
+            nonEps = model(x_t, original_t_values, torch.zeros_like(labels))
             eps_comb = (1. + w) * eps - w * nonEps
 
-            # Compute coefficients
-            alpha_bar = alphas_bar[start_idx + t : end_idx + t + 1]
+            # Calculate coefficients
+            alpha_bar = alphas_bar[start_idx + t:end_idx + t + 1]
             alpha_bar_reshaped = alpha_bar[:, None, None, None].to(torch.float32)
 
-            alpha_bar_from_t_slice = alphas_bar_from_t[start_idx:end_idx + 1]
-            alpha_bar_from_t_reshaped = alpha_bar_from_t_slice[:, None, None, None].to(torch.float32)
+            alpha_bar_from_t = alphas_bar_from_t[start_idx:end_idx + 1]
+            alpha_bar_from_t_reshaped = alpha_bar_from_t[:, None, None, None].to(torch.float32)
 
-            coeff1 = torch.sqrt(1.0 / alpha_bar_from_t_reshaped)
+            coeff1 = torch.sqrt(1 / alpha_bar_from_t_reshaped)
             coeff2 = (1 - alpha_bar_from_t_reshaped) / torch.sqrt(1 - alpha_bar_reshaped)
 
-            # MMSE estimates of x_t
+            # Calculate mmse estimates of x_t
             x_hat_cond = coeff1 * (x_t - coeff2 * eps_comb)
             x_hat_uncond = coeff1 * (x_t - coeff2 * nonEps)
 
-            # Reshape input image for difference calculation
-            img_reshaped = img.unsqueeze(0)  # Shape: (1, C, H, W)
+            img_reshaped = img[None, :, :, :]
 
-            # Compute differences
             diff_unconditional = img_reshaped - x_hat_uncond
             diff_tensor = img_reshaped - x_hat_cond
 
-            # Compute squared L2 norms
             squared_l2_unconditional = (diff_unconditional ** 2).sum(dim=(1, 2, 3))
             squared_l2_tensor = (diff_tensor ** 2).sum(dim=(1, 2, 3))
 
-            # Difference in squared norms
             difference = squared_l2_unconditional - squared_l2_tensor
 
-            # Compute SNR differences
             snr_diff = -1 * (snr[1:] - snr[:-1])
 
-            # Accumulate standard integral
             standard_integral += torch.sum(difference[1:] * snr_diff, dim=0)
 
-            # Compute Ito integral
-            difference = x_hat_cond - x_hat_uncond
+            difference = x_hat_cond[:, :, :, :] - x_hat_uncond[:, :, :, :]
+
             ito_integral += (difference * delta_W).sum()
 
     return 0.5 * standard_integral, 0.5 * standard_integral + ito_integral
 
-# Prepare your image and label
-# For demonstration, we'll use a random tensor. Replace this with your actual image tensor.
-# Ensure the image tensor is normalized as per Stable Diffusion's requirements.
-img = torch.randn(3, 512, 512).to("cuda")  # Example for a 512x512 image
+def visualize_single_image(image_tensor):
+    if image_tensor.shape != (3, 32, 32):
+        raise ValueError("Invalid shape")
+    image_tensor = (image_tensor + 1) / 2.0
+    image_array = image_tensor.numpy().transpose((1, 2, 0))
+    plt.imshow(image_array)
+    plt.axis('off')
+    plt.show()
 
-label = 0  # Replace with your actual label
-model_num = 0  # Not used in this context
-t = 1000  # Example timestep
-w = 1.0  # Weight parameter
+def visualize_25_images(image_tensor):
+    if len(image_tensor) != 25 or image_tensor.shape[1:] != (3, 32, 32):
+        raise ValueError("Invalid shape")
 
-# Compute PMI
-standard_integral, total_pmi = get_intermediate_pointwise_mutual_info(
-    img=img,
-    label=label,
-    model_num=model_num,
-    t=t,
-    w=w,
-    pipeline=pipeline
-)
+    fig, axes = plt.subplots(5, 5, figsize=(15, 15),
+                             subplot_kw={'xticks':[], 'yticks':[]},
+                             gridspec_kw=dict(hspace=0.1, wspace=0.1))
 
-print("Standard Integral:", standard_integral.item())
-print("Total PMI:", total_pmi.item())
+    for i, ax in enumerate(axes.flat):
+        img = image_tensor[i].numpy().transpose((1, 2, 0))
+        img = (img + 1) / 2.0  # Assuming image was in [-1, 1], scale it back to [0, 1]
+        ax.imshow(img)
+
+    plt.show()
+
+def visualize_100_images(image_tensor):
+    if len(image_tensor) != 100 or image_tensor.shape[1:] != (3, 32, 32):
+        raise ValueError("Invalid shape")
+
+    fig, axes = plt.subplots(10, 10, figsize=(15, 15),
+                             subplot_kw={'xticks':[], 'yticks':[]},
+                             gridspec_kw=dict(hspace=0.1, wspace=0.1))
+
+    for i, ax in enumerate(axes.flat):
+        img = image_tensor[i].numpy().transpose((1, 2, 0))
+        img = (img + 1) / 2.0  # Assuming image was in [-1, 1], scale it back to [0, 1]
+        ax.imshow(img)
+
+    plt.show()
+
+def visualize_100_images_with_est(image_tensor, num_array):
+    if len(image_tensor) != 100 or image_tensor.shape[1:] != (3, 32, 32) or len(num_array) != 100:
+        raise ValueError("Invalid shape")
+
+    fig, axes = plt.subplots(10, 10, figsize=(15, 18),  # Adjust figure size
+                             subplot_kw={'xticks':[], 'yticks':[]},
+                             gridspec_kw=dict(hspace=0.4, wspace=0.1))
+
+    for i, ax in enumerate(axes.flat):
+        img = image_tensor[i].numpy().transpose((1, 2, 0))
+        img = (img + 1) / 2.0  # Assuming image was in [-1, 1], scale it back to [0, 1]
+        ax.imshow(img)
+        ax.text(0.5, -0.2, str(round(num_array[i], 2)), size=12, ha="center", transform=ax.transAxes)
+
+    plt.show()
+
+def generate_and_classify_misgenerated_images(modelConfig, label, num_misgenerated_required):
+    misgenerated_images = []
+    count = 0
+
+    device = torch.device(modelConfig["device"])
+
+    with torch.no_grad():
+        model = UNet(T=modelConfig["T"], num_labels=10, ch=modelConfig["channel"], ch_mult=modelConfig["channel_mult"],
+                        num_res_blocks=modelConfig["num_res_blocks"], dropout=modelConfig["dropout"]).to(device)
+        ckpt = torch.load(os.path.join(modelConfig["save_dir"], modelConfig["test_load_weight"]), map_location=device)
+        model.load_state_dict(ckpt)
+        model.eval()
+
+        classifier = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar10_repvgg_a2", pretrained=True)
+        classifier = classifier.to(modelConfig["device"])
+        classifier.eval()
+
+        sampler = GaussianDiffusionSampler(
+            model, modelConfig["beta_1"], modelConfig["beta_T"], modelConfig["T"], w=modelConfig["w"]).to(device)
+
+        while count < num_misgenerated_required:
+            noisyImage = torch.randn(
+                size=[modelConfig["batch_size"], 3, modelConfig["img_size"], modelConfig["img_size"]], device=device)
+            sampledImgs = sampler(noisyImage, torch.tensor([label]*modelConfig["batch_size"]).to(device))
+
+            output = classifier(sampledImgs)
+            _, predicted = torch.max(output.data, 1)
+            predicted_labels = predicted + 1
+
+            indices_not_equal = torch.nonzero(predicted_labels != label).squeeze()
+            if len(indices_not_equal) > 0:
+                misgenerated_images.extend(sampledImgs[indices_not_equal])
+                count += len(indices_not_equal)
+
+    # Save the misgenerated images
+    torch.save(misgenerated_images, f"misgenerated_images_label_{label}_4000steps.pt") # remove
+
+    return misgenerated_images
+
+def get_est(Img, label, model_num, t, iter=5):
+    result = 0
+    for _ in range(iter):
+        _, est = get_intermediate_pointwise_mutual_info(Img, label, model_num, t)
+        result += est
+    return result/iter
+
+print("sampled images done.")
+
+final_tensor = torch.load('/Users/dong-yonghoon/Desktop/Pointwise-mutual-information-diffusion/final_00045.pt')
+intermediate_tensor = torch.load('/Users/dong-yonghoon/Desktop/Pointwise-mutual-information-diffusion/final_00046.pt')
+
+print("tensor loaded.")
+
+est_list_list = []
+
+for index in range(batch_size):
+    est_list = []
+    time = 0
+
+    for t in range(3750, 250 - 1, -250):
+        est = get_est(x_t_tensor[index][time], label, model_num=0, t=t, iter=5).cpu().numpy()
+        est_list.append(est)
+        time += 1
+
+    est = get_est(sampledImgs[index], label, model_num=0, t=0, iter=5).cpu().numpy()
+    est_list.append(est)
+    est_list = np.array(est_list)
+    est_list_list.append(est_list)
+    torch.save(est_list, '../output/PMI_label_'+str(label)+'_index_'+str(index)+'.pt')
+    print("PMI index", index, "finished.")
+
+est_list_list = torch.tensor(np.array(est_list_list))
+torch.save(est_list_list, '../output/PMI_label_'+str(label)+'.pt')
+print("saved")

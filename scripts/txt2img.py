@@ -334,23 +334,23 @@ def main():
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
                         # Initialize an empty list to collect tensors
-                        intermediate_tensor = []
+                        #intermediate_tensor = []
 
                         # Simulate a loop where tensors are generated
-                        for i in range(len(intermediate['x_inter'])):
-                            tensor = intermediate['x_inter'][i]
-                            tensor_samples_ddim = model.decode_first_stage(tensor)
-                            tensor_samples_ddim = torch.clamp((tensor_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                            tensor_samples_ddim = tensor_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+                        #for i in range(len(intermediate['x_inter'])):
+                        #    tensor = intermediate['x_inter'][i]
+                        #    tensor_samples_ddim = model.decode_first_stage(tensor)
+                        #    tensor_samples_ddim = torch.clamp((tensor_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                        #    tensor_samples_ddim = tensor_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                            tensor_checked_image, has_nsfw_concept = check_safety(tensor_samples_ddim)
+                        #    tensor_checked_image, has_nsfw_concept = check_safety(tensor_samples_ddim)
 
-                            tensor_checked_image_torch = torch.from_numpy(tensor_checked_image).permute(0, 3, 1, 2)
-                            intermediate_tensor.append(tensor_checked_image_torch)
-                        intermediate_tensor = torch.cat(intermediate_tensor)
+                        #    tensor_checked_image_torch = torch.from_numpy(tensor_checked_image).permute(0, 3, 1, 2)
+                        #    intermediate_tensor.append(tensor_checked_image_torch)
+                        #intermediate_tensor = torch.cat(intermediate_tensor)
                         
                         # 최종 이미지 텐서를 저장 (처음, 중간과정(log_exp단위마다), 맨 끝 이미지)
-                        save_intermediate(intermediate_tensor, sample_path, base_count)
+                        save_intermediate(intermediate, sample_path, base_count)
                         
                         if not opt.skip_save:
                             for x_sample in x_checked_image_torch:

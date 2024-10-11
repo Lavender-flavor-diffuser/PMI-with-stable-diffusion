@@ -211,6 +211,13 @@ def get_intermediate_pointwise_mutual_info(opt, config, img, label, t, w=1.0):
 
     return 0.5 * standard_integral, 0.5 * standard_integral + ito_integral
 
+def get_est(opt, config, Img, prompt, t, iter=5):
+    result = 0
+    for _ in range(iter):
+        _, est = get_intermediate_pointwise_mutual_info(opt, config, Img, prompt, t)
+        result += est
+    return result/iter
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -490,7 +497,32 @@ def main():
 
     print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
           f" \nEnjoy.")
+    
+    x_t_tensor = torch.load(sample_path)
+    label = opt.prompt
 
+    est_list_list = []
+
+    for index in range(opt.n_samples):
+        est_list = []
+        time = 0
+        
+        for t in range(3750, 250 - 1, -250):
+            # opt, config, Img, prompt, t, iter=5
+            est = get_est(opt, config, x_t_tensor[index][time], label, t=t, iter=5).cpu().numpy()
+            est_list.append(est)
+            time += 1
+
+        # est = get_est(sampledImgs[index], label, model_num=0, t=0, iter=5).cpu().numpy()
+        # est_list.append(est)
+        est_list = np.array(est_list)
+        est_list_list.append(est_list)
+        torch.save(est_list, '../output/PMI_label_'+str(label)+'_index_'+str(index)+'.pt')
+        print("PMI index", index, "finished.")
+
+    est_list_list = torch.tensor(np.array(est_list_list))
+    torch.save(est_list_list, '../output/PMI_label_'+str(label)+'.pt')
+    print("saved")
 
 if __name__ == "__main__":
     main()

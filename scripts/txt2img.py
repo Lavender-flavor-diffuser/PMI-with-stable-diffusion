@@ -211,7 +211,11 @@ def get_intermediate_pointwise_mutual_info(opt, config, img, prompt, t, w=1.0):
 def get_est(opt, config, Img, prompt, t, iter=5):
     result = 0
     for _ in range(iter):
+<<<<<<< HEAD
         _, est = get_intermediate_pointwise_mutual_info(opt, config,Img, prompt, t)
+=======
+        _, est = get_intermediate_pointwise_mutual_info(opt, config, Img, prompt, t)
+>>>>>>> 4148abb84d5840f22cb4be4aea8a20348c304ec3
         result += est
     return result/iter
 
@@ -490,7 +494,11 @@ def main():
 
     print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
           f" \nEnjoy.")
+    
+    x_t_tensor = torch.load(sample_path)
+    label = opt.prompt
 
+<<<<<<< HEAD
     # PMI Calculation : time(51) * batch_size(--n_sample에 의해 조정) * Channel(4) * Height(64) * Width(64)
     est_list_list = []  # Stores PMI for all samples
 
@@ -527,6 +535,30 @@ def main():
     est_list_list_tensor = torch.tensor(est_list_list)
     torch.save(est_list_list_tensor, f'../output/PMI_query_{opt.prompt}.pt')
     print("Saved PMI indices.")
+=======
+    est_list_list = []
+
+    for index in range(opt.n_samples):
+        est_list = []
+        time = 0
+        
+        for t in range(3750, 250 - 1, -250):
+            # opt, config, Img, prompt, t, iter=5
+            est = get_est(opt, config, x_t_tensor[index][time], label, t=t, iter=5).cpu().numpy()
+            est_list.append(est)
+            time += 1
+
+        # est = get_est(sampledImgs[index], label, model_num=0, t=0, iter=5).cpu().numpy()
+        # est_list.append(est)
+        est_list = np.array(est_list)
+        est_list_list.append(est_list)
+        torch.save(est_list, '../output/PMI_label_'+str(label)+'_index_'+str(index)+'.pt')
+        print("PMI index", index, "finished.")
+
+    est_list_list = torch.tensor(np.array(est_list_list))
+    torch.save(est_list_list, '../output/PMI_label_'+str(label)+'.pt')
+    print("saved")
+>>>>>>> 4148abb84d5840f22cb4be4aea8a20348c304ec3
 
 if __name__ == "__main__":
     main()

@@ -114,15 +114,10 @@ def simulate_BM(x, gamma_list):
     return W_gamma, delta_W, z_gamma
 
 
-def get_intermediate_pointwise_mutual_info(opt, config, img, label, t, w=1.0):
+def get_intermediate_pointwise_mutual_info(opt, config, img, prompt, t, w=1.0):
     with torch.no_grad():
         # Load model
         device = torch.device("cuda:0")
-        # model = UNet(T=4000, num_labels=10, ch=128, ch_mult=[1, 2, 2, 2], num_res_blocks=2, dropout=0.15).to(device)
-        # ckpt = torch.load(os.path.join("../data/", "ckpt_99_.pt"), map_location=device)
-        # model.load_state_dict(ckpt)
-        # model.eval().to(device)
-
         config = OmegaConf.load(f"{opt.config}")
         model = load_model_from_config(config, f"{opt.ckpt}")
 
@@ -134,7 +129,7 @@ def get_intermediate_pointwise_mutual_info(opt, config, img, label, t, w=1.0):
         ito_integral = 0.0
 
         # Conventional notations used in DDPM paper
-        betas = torch.linspace(1e-4, 0.028, 4000).double()
+        betas = torch.linspace(1e-4, 0.028, 1000).double()
         alphas = 1. - betas
         alphas_bar = torch.cumprod(alphas, dim=0).to(device)
 
@@ -147,21 +142,21 @@ def get_intermediate_pointwise_mutual_info(opt, config, img, label, t, w=1.0):
         W_gamma, delta_Ws, z_gammas = simulate_BM(img, torch.flip(snrs, [0]))
         W_gamma = torch.flip(W_gamma, [0])
         delta_Ws = torch.flip(delta_Ws, [0])
-        delta_Ws = torch.cat((torch.zeros((1, 3, 64, 64)).to(device), delta_Ws), dim=0)
+        delta_Ws = torch.cat((torch.zeros((1, 4, 64, 64)).to(device), delta_Ws), dim=0)
         z_gammas = torch.flip(z_gammas, [0])
 
-        # Scale z_gamma approriately to get x_t
+        # Scale z_gamma appropriately to get x_t
         alphas_bar_from_t_reshaped = alphas_bar_from_t[:, None, None, None].to(torch.float32)
         z_gammas = z_gammas.to(torch.float32)
         x_ts = z_gammas * (1 - alphas_bar_from_t_reshaped) / torch.sqrt(alphas_bar_from_t_reshaped)
 
-        size = 4000 - t
+        size = 1000 - t
 
         # Limit maximum batch size to 1000
-        for i in range((size-1)//1000+1):
+        for i in range((size-1)//100+1):
             # timestep t corresponds to index 0
-            start_idx = i*1000
-            end_idx = min((i+1)*1000-1, size - 1)
+            start_idx = i*100
+            end_idx = min((i+1)*100-1, size - 1)
 
             # Truncate appropriately
             snr = snrs[start_idx:end_idx+1]
@@ -170,11 +165,13 @@ def get_intermediate_pointwise_mutual_info(opt, config, img, label, t, w=1.0):
 
             original_t_values = torch.arange(start_idx + t, end_idx + t + 1, 1).to(device)
 
-            labels = torch.full((end_idx - start_idx + 1,), label, dtype=torch.int).to(device)
+            # Define batch_size
+            batch_size = x_t.shape[0]  # x_t의 첫 번째 차원에서 배치 크기 가져오기
 
             # Inference
-            eps = model(x_t, original_t_values, labels)
-            nonEps = model(x_t, original_t_values, torch.zeros_like(labels))
+            c = model.get_learned_conditioning(batch_size * [prompt])  # prompt를 사용
+            eps = model(x_t, original_t_values, c)  # 조건부 샘플링
+            nonEps = model(x_t, original_t_values, torch.zeros_like(c))
             eps_comb = (1. + w) * eps - w * nonEps
 
             # Calculate coefficients
@@ -210,6 +207,13 @@ def get_intermediate_pointwise_mutual_info(opt, config, img, label, t, w=1.0):
             ito_integral += (difference * delta_W).sum()
 
     return 0.5 * standard_integral, 0.5 * standard_integral + ito_integral
+
+def get_est(opt, config, Img, prompt, t, iter=5):
+    result = 0
+    for _ in range(iter):
+        _, est = get_intermediate_pointwise_mutual_info(opt, config,Img, prompt, t)
+        result += est
+    return result/iter
 
 def main():
     parser = argparse.ArgumentParser()
@@ -408,6 +412,8 @@ def main():
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
     precision_scope = autocast if opt.precision=="autocast" else nullcontext
+    all_intermediates = []  # To store all intermediate tensors
+
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
@@ -422,18 +428,28 @@ def main():
                             prompts = list(prompts)
                         c = model.get_learned_conditioning(prompts)
                         shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                        samples_ddim, intermediate = sampler.sample(S=opt.ddim_steps,
-                                                         conditioning=c,
-                                                         batch_size=opt.n_samples,
-                                                         shape=shape,
-                                                         verbose=False,
-                                                         unconditional_guidance_scale=opt.scale,
-                                                         unconditional_conditioning=uc,
-                                                         eta=opt.ddim_eta,
-                                                         x_T=start_code,
-                                                         log_every_t = opt.log_every_t
-                                                         )
-                        
+                        samples_ddim, intermediate = sampler.sample(
+                            S=opt.ddim_steps,
+                            conditioning=c,
+                            batch_size=opt.n_samples,
+                            shape=shape,
+                            verbose=False,
+                            unconditional_guidance_scale=opt.scale,
+                            unconditional_conditioning=uc,
+                            eta=opt.ddim_eta,
+                            x_T=start_code,
+                            log_every_t=opt.log_every_t
+                        )
+                        all_intermediates.append(intermediate)  # Store intermediate tensors
+
+                        # All tensors are assumed to be on CPU
+                        est_cpu = [tensor.cpu().numpy() for tensor in intermediate['x_inter']]
+
+                        # Convert to NumPy array
+                        est_array = np.array(est_cpu)
+
+                        print(f"est_array의 shape: {est_array.shape}")
+
                         ## Decoding Latent Representations to Images (이전까지는 latent space 상에서의 tensor)
                         x_samples_ddim = model.decode_first_stage(samples_ddim)
                         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
@@ -443,25 +459,9 @@ def main():
 
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
-                        # Initialize an empty list to collect tensors
-                        #intermediate_tensor = []
-
-                        # Simulate a loop where tensors are generated
-                        #for i in range(len(intermediate['x_inter'])):
-                        #    tensor = intermediate['x_inter'][i]
-                        #    tensor_samples_ddim = model.decode_first_stage(tensor)
-                        #    tensor_samples_ddim = torch.clamp((tensor_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                        #    tensor_samples_ddim = tensor_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
-
-                        #    tensor_checked_image, has_nsfw_concept = check_safety(tensor_samples_ddim)
-
-                        #    tensor_checked_image_torch = torch.from_numpy(tensor_checked_image).permute(0, 3, 1, 2)
-                        #    intermediate_tensor.append(tensor_checked_image_torch)
-                        #intermediate_tensor = torch.cat(intermediate_tensor)
-                        
-                        # 최종 이미지 텐서를 저장 (처음, 중간과정(log_exp단위마다), 맨 끝 이미지)
+                        # Save intermediate tensors
                         save_intermediate(intermediate, sample_path, base_count)
-                        
+
                         if not opt.skip_save:
                             for x_sample in x_checked_image_torch:
                                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
@@ -474,12 +474,12 @@ def main():
                             all_samples.append(x_checked_image_torch)
 
                 if not opt.skip_grid:
-                    # additionally, save as grid
+                    # Additionally, save as grid
                     grid = torch.stack(all_samples, 0)
                     grid = rearrange(grid, 'n b c h w -> (n b) c h w')
                     grid = make_grid(grid, nrow=n_rows)
 
-                    # to image
+                    # To image
                     grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
                     img = Image.fromarray(grid.astype(np.uint8))
                     img = put_watermark(img, wm_encoder)
@@ -491,6 +491,42 @@ def main():
     print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
           f" \nEnjoy.")
 
+    # PMI Calculation : time(51) * batch_size(--n_sample에 의해 조정) * Channel(4) * Height(64) * Width(64)
+    est_list_list = []  # Stores PMI for all samples
+
+    for sample_num in range(opt.n_samples):
+        est_list = []  # Stores PMI for each sample
+        # Avoid using 'time' as a variable name to prevent shadowing the 'time' module
+        current_time = 0  
+
+        # Retrieve the intermediate dict for the current sample
+        intermediate_dict = all_intermediates[sample_num]
+        
+        # Access the list of intermediate tensors
+        # Replace 'x_inter' with the correct key if it's different
+        x_inter_list = intermediate_dict['x_inter']  
+        
+        # Iterate over each intermediate tensor
+        for time_idx, img_tensor in enumerate(x_inter_list):
+            # Calculate the corresponding timestep
+            t = 1000 - time_idx * 20
+            
+            # Call get_est with the correct arguments
+            est = get_est(opt, config, img_tensor, opt.prompt, t)
+            est_list.append(est)
+        
+        # Convert est_list to a NumPy array and append to est_list_list
+        est_array = np.array(est_list)
+        est_list_list.append(est_array)
+        
+        # Save PMI for the current sample
+        torch.save(est_array, f'../output/PMI_query_{opt.prompt}_sample_num_{sample_num}.pt')
+        print(f"PMI index {sample_num} finished.")
+
+    # Convert the entire PMI list to a tensor and save
+    est_list_list_tensor = torch.tensor(est_list_list)
+    torch.save(est_list_list_tensor, f'../output/PMI_query_{opt.prompt}.pt')
+    print("Saved PMI indices.")
 
 if __name__ == "__main__":
     main()

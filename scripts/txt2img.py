@@ -19,6 +19,9 @@ from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 
+from diffusers import UNet2DConditionModel, AutoencoderKL, DDIMScheduler
+from transformers import CLIPTextModel, CLIPTokenizer
+
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
 
@@ -113,105 +116,127 @@ def simulate_BM(x, gamma_list):
     z_gamma = gamma_list.view(-1, 1, 1, 1).to(x.device) * x + W_gamma
     return W_gamma, delta_W, z_gamma
 
-
-def get_intermediate_pointwise_mutual_info(opt, config, img, prompt, t, w=1.0):
+def get_intermediate_pointwise_mutual_info(latent, text_prompt, t, w=1.0):
     with torch.no_grad():
-        # Load model
-        device = torch.device("cuda:0")
-        config = OmegaConf.load(f"{opt.config}")
-        model = load_model_from_config(config, f"{opt.ckpt}")
-
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        model = model.to(device)
-
-        # Initialize two terms
+        # Set device
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        
+        # Load Stable Diffusion components
+        model_id = "CompVis/stable-diffusion-v1-4"
+        unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(device)
+        tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
+        scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
+        
+        # Encode the text prompt
+        text_inputs = tokenizer(
+            text_prompt,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
+        
+        # Ensure the latent vector is on the correct device and has the right shape
+        latent = latent.to(device)
+        if latent.dim() == 3:
+            latent = latent.unsqueeze(0)  # Add batch dimension if missing
+        
+        # Prepare diffusion timesteps
+        num_inference_steps = scheduler.config.num_train_timesteps
+        timesteps = torch.linspace(0, num_inference_steps - 1, num_inference_steps, device=device).long()
+        
+        # Initialize integrals
         standard_integral = 0.0
         ito_integral = 0.0
+        
+        # Get alphas_cumprod from scheduler
+        alphas_cumprod = scheduler.alphas_cumprod.to(device)
+        
+        # Compute alphas_cumprod_prev by shifting alphas_cumprod
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0], device=device), alphas_cumprod[:-1]])
+        
+        # Reverse the timesteps for the loop
+        timesteps = timesteps.flip(0)
+        
+        # Start from timestep t
+        timesteps = timesteps[t:]
+        
+        # Prepare initial noise
+        noise = torch.randn_like(latent)
+        
+        # Simulate the diffusion process
+        for i, timestep in enumerate(timesteps):
+            # Get model output
+            latent_input = latent if i == 0 else latent_noisy
+            timestep_tensor = torch.tensor([timestep], device=device).expand(latent_input.shape[0])
+    
+            # Conditional and unconditional predictions
+            noise_pred_cond = unet(
+                latent_input, timestep_tensor, encoder_hidden_states=text_embeddings
+            ).sample
+            # For unconditional prediction, create empty embeddings or use zeros
+            max_length = text_encoder.config.max_position_embeddings
+            uncond_input = tokenizer(
+                [""] * latent_input.shape[0],
+                padding="max_length",
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
+            noise_pred_uncond = unet(
+                latent_input, timestep_tensor, encoder_hidden_states=uncond_embeddings
+            ).sample
+            
+            # Apply classifier-free guidance
+            noise_pred = noise_pred_uncond + w * (noise_pred_cond - noise_pred_uncond)
+            
+            # Compute estimates
+            alpha = alphas_cumprod[timestep]
+            alpha_prev = alphas_cumprod_prev[timestep]
+            beta = 1 - alpha / alpha_prev
+            beta = beta.to(device)
+            
+            # Predicted previous latent (x_hat)
+            latent_hat_cond = (latent_input - beta.sqrt() * noise_pred) / alpha.sqrt()
+            latent_hat_uncond = (latent_input - beta.sqrt() * noise_pred_uncond) / alpha.sqrt()
+            
+            # Compute differences
+            diff_unconditional = latent - latent_hat_uncond
+            diff_conditional = latent - latent_hat_cond
+            
+            squared_l2_unconditional = (diff_unconditional ** 2).sum()
+            squared_l2_conditional = (diff_conditional ** 2).sum()
+            
+            difference = squared_l2_unconditional - squared_l2_conditional
+            
+            # Compute SNR differences
+            snr = alpha / (1 - alpha)
+            if i > 0:
+                alpha_prev_t = alphas_cumprod[timesteps[i - 1]]
+                snr_prev = alpha_prev_t / (1 - alpha_prev_t)
+                snr_diff = -1 * (snr - snr_prev)
+            else:
+                snr_diff = snr  # Initial step
+            
+            standard_integral += difference * snr_diff
+            
+            # Update latent with noise (simulate the reverse diffusion step)
+            noise = torch.randn_like(latent)
+            latent_noisy = alpha.sqrt() * latent_hat_cond + (1 - alpha).sqrt() * noise
+            
+            # Compute Ito integral
+            difference_latent = latent_hat_cond - latent_hat_uncond
+            ito_integral += (difference_latent * noise).sum()
+        
+        return 0.5 * standard_integral, 0.5 * standard_integral + ito_integral
 
-        # Conventional notations used in DDPM paper
-        betas = torch.linspace(1e-4, 0.028, 1000).double()
-        alphas = 1. - betas
-        alphas_bar = torch.cumprod(alphas, dim=0).to(device)
-
-        # alpha bar calculated from t (intermediate timestep)
-        alphas_bar_from_t = torch.cumprod(alphas[t:], dim=0).to(device)
-        # snr when we consider input at timestep t
-        snrs = (alphas_bar_from_t / (1. - alphas_bar_from_t))
-
-        # Simulate BM from t taking account of new snr values above
-        W_gamma, delta_Ws, z_gammas = simulate_BM(img, torch.flip(snrs, [0]))
-        W_gamma = torch.flip(W_gamma, [0])
-        delta_Ws = torch.flip(delta_Ws, [0])
-        delta_Ws = torch.cat((torch.zeros((1, 4, 64, 64)).to(device), delta_Ws), dim=0)
-        z_gammas = torch.flip(z_gammas, [0])
-
-        # Scale z_gamma appropriately to get x_t
-        alphas_bar_from_t_reshaped = alphas_bar_from_t[:, None, None, None].to(torch.float32)
-        z_gammas = z_gammas.to(torch.float32)
-        x_ts = z_gammas * (1 - alphas_bar_from_t_reshaped) / torch.sqrt(alphas_bar_from_t_reshaped)
-
-        size = 1000 - t
-
-        # Limit maximum batch size to 1000
-        for i in range((size-1)//100+1):
-            # timestep t corresponds to index 0
-            start_idx = i*100
-            end_idx = min((i+1)*100-1, size - 1)
-
-            # Truncate appropriately
-            snr = snrs[start_idx:end_idx+1]
-            x_t = x_ts[start_idx:end_idx+1]
-            delta_W = delta_Ws[start_idx:end_idx+1]
-
-            original_t_values = torch.arange(start_idx + t, end_idx + t + 1, 1).to(device)
-
-            # Define batch_size
-            batch_size = x_t.shape[0]  # x_t의 첫 번째 차원에서 배치 크기 가져오기
-
-            # Inference
-            c = model.get_learned_conditioning(batch_size * [prompt])  # prompt를 사용
-            eps = model(x_t, original_t_values, c)  # 조건부 샘플링
-            nonEps = model(x_t, original_t_values, torch.zeros_like(c))
-            eps_comb = (1. + w) * eps - w * nonEps
-
-            # Calculate coefficients
-            alpha_bar = alphas_bar[start_idx + t:end_idx + t + 1]
-            alpha_bar_reshaped = alpha_bar[:, None, None, None].to(torch.float32)
-
-            alpha_bar_from_t = alphas_bar_from_t[start_idx:end_idx + 1]
-            alpha_bar_from_t_reshaped = alpha_bar_from_t[:, None, None, None].to(torch.float32)
-
-            coeff1 = torch.sqrt(1 / alpha_bar_from_t_reshaped)
-            coeff2 = (1 - alpha_bar_from_t_reshaped) / torch.sqrt(1 - alpha_bar_reshaped)
-
-            # Calculate mmse estimates of x_t
-            x_hat_cond = coeff1 * (x_t - coeff2 * eps_comb)
-            x_hat_uncond = coeff1 * (x_t - coeff2 * nonEps)
-
-            img_reshaped = img[None, :, :, :]
-
-            diff_unconditional = img_reshaped - x_hat_uncond
-            diff_tensor = img_reshaped - x_hat_cond
-
-            squared_l2_unconditional = (diff_unconditional ** 2).sum(dim=(1, 2, 3))
-            squared_l2_tensor = (diff_tensor ** 2).sum(dim=(1, 2, 3))
-
-            difference = squared_l2_unconditional - squared_l2_tensor
-
-            snr_diff = -1 * (snr[1:] - snr[:-1])
-
-            standard_integral += torch.sum(difference[1:] * snr_diff, dim=0)
-
-            difference = x_hat_cond[:, :, :, :] - x_hat_uncond[:, :, :, :]
-
-            ito_integral += (difference * delta_W).sum()
-
-    return 0.5 * standard_integral, 0.5 * standard_integral + ito_integral
-
-def get_est(opt, config, Img, prompt, t, iter=5):
+def get_est(Img, prompt, t, iter=5):
     result = 0
     for _ in range(iter):
-        _, est = get_intermediate_pointwise_mutual_info(opt, config,Img, prompt, t)
+        _, est = get_intermediate_pointwise_mutual_info(Img, prompt, t)
         result += est
     return result/iter
 
@@ -222,7 +247,7 @@ def main():
         "--prompt",
         type=str,
         nargs="?",
-        default="a painting of a virus monster playing guitar",
+        default="Ann Graham Lotz",
         help="the prompt to render"
     )
     parser.add_argument(
@@ -245,7 +270,7 @@ def main():
     parser.add_argument(
         "--ddim_steps",
         type=int,
-        default=50,
+        default=20,
         help="number of ddim sampling steps",
     )
     parser.add_argument(
@@ -277,7 +302,7 @@ def main():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=2,
+        default=1,
         help="sample this often",
     )
     parser.add_argument(
@@ -307,7 +332,7 @@ def main():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=3,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a. batch size",
     )
     parser.add_argument(
@@ -355,8 +380,8 @@ def main():
     parser.add_argument(
         "--log_every_t",
         type=int,
-        help="determine the intermediate save period (Default : 100)",
-        default=100
+        help="determine the intermediate save period (Default : 1)",
+        default=1
     )
     opt = parser.parse_args()
 
@@ -494,39 +519,40 @@ def main():
     # PMI Calculation : time(51) * batch_size(--n_sample에 의해 조정) * Channel(4) * Height(64) * Width(64)
     est_list_list = []  # Stores PMI for all samples
 
-    for sample_num in range(opt.n_samples):
+    for iter_num in range(opt.n_iter):
         est_list = []  # Stores PMI for each sample
-        # Avoid using 'time' as a variable name to prevent shadowing the 'time' module
-        current_time = 0  
-
+        
         # Retrieve the intermediate dict for the current sample
-        intermediate_dict = all_intermediates[sample_num]
+        # 
+        intermediate_dict = all_intermediates[iter_num]
         
         # Access the list of intermediate tensors
         # Replace 'x_inter' with the correct key if it's different
-        x_inter_list = intermediate_dict['x_inter']  
+        x_inter_list = intermediate_dict['x_inter']
         
-        # Iterate over each intermediate tensor
-        for time_idx, img_tensor in enumerate(x_inter_list):
-            # Calculate the corresponding timestep
-            t = 1000 - time_idx * 20
+        for sample_num in range(opt.n_samples):
+            # Iterate over each intermediate tensor
+            for time_idx, img_tensor in enumerate(x_inter_list):
+                if(time_idx == 0) : continue 
+                # Calculate the corresponding timestep
+                t = 1000 - time_idx * (1000 // opt.ddim_steps)
+                
+                # Call get_est with the correct arguments
+                est = get_est(img_tensor[sample_num], opt.prompt, t)
+                est_list.append(est)
+        
+            # Convert est_list to a NumPy array and append to est_list_list
+            est_array = np.array(est_list)
+            est_list_list.append(est_array)
             
-            # Call get_est with the correct arguments
-            est = get_est(opt, config, img_tensor, opt.prompt, t)
-            est_list.append(est)
-        
-        # Convert est_list to a NumPy array and append to est_list_list
-        est_array = np.array(est_list)
-        est_list_list.append(est_array)
-        
         # Save PMI for the current sample
-        torch.save(est_array, f'../output/PMI_query_{opt.prompt}_sample_num_{sample_num}.pt')
+        torch.save(est_array, f'../output/PMI_query_{opt.prompt}_sample_num_{sample_num}_iter_num_{iter_num}.pt')
         print(f"PMI index {sample_num} finished.")
 
-    # Convert the entire PMI list to a tensor and save
-    est_list_list_tensor = torch.tensor(est_list_list)
-    torch.save(est_list_list_tensor, f'../output/PMI_query_{opt.prompt}.pt')
-    print("Saved PMI indices.")
+        # Convert the entire PMI list to a tensor and save
+        est_list_list_tensor = torch.tensor(est_list_list)
+        torch.save(est_list_list_tensor, f'../output/PMI_query_{opt.prompt}_iter_num_{iter_num}.pt')
+        print("Saved PMI indices.")
 
 if __name__ == "__main__":
     main()

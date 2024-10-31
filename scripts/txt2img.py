@@ -199,8 +199,6 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
             nonEps = unet(
                 batch_x_t, original_t_values, encoder_hidden_states=uncond_embeddings
             ).sample
-            # Classifier-free guidance
-            # eps_comb = (1. + w) * eps - w * nonEps
             
             # Calculate coefficients
             alpha_bar_batch = alphas_bar[start_idx + t : end_idx + t + 1]
@@ -216,6 +214,7 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
             x_hat_uncond = coeff_lambda_inverse * (batch_x_t + coeff_sigma_square * nonEps)
             x_hat_cond = coeff_lambda_inverse * (batch_x_t + coeff_sigma_square * eps)
             
+            # Calculating standard integral
             latent_reshaped = latent[None, :, :, :]
             
             diff_unconditional = latent_reshaped - x_hat_uncond
@@ -223,18 +222,17 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
 
             squared_l2_unconditional = (diff_unconditional ** 2).sum(dim=(1, 2, 3))
             squared_l2_conditional = (diff_conditional ** 2).sum(dim=(1, 2, 3))
-
-            difference = squared_l2_unconditional - squared_l2_conditional
-
+            
+            integrand_in_standard_integral = squared_l2_unconditional - squared_l2_conditional 
             snr_diff = (batch_snr[1:] - batch_snr[:-1])
             snr_diff = snr_diff.unsqueeze(1)
-            riemann_sum = difference[1:] * snr_diff
+            riemann_sum = integrand_in_standard_integral[1:] * snr_diff
             
             standard_integral += torch.sum(riemann_sum)
 
-            difference = x_hat_cond[:, :, :, :] - x_hat_uncond[:, :, :, :]
-
-            ito_integral += (difference * batch_delta_W).sum()
+            # Calculating ito integral
+            integrand_in_ito_integral = x_hat_cond[:, :, :, :] - x_hat_uncond[:, :, :, :]
+            ito_integral += (integrand_in_ito_integral * batch_delta_W).sum()
         return 0.5 * standard_integral, 0.5 * standard_integral + ito_integral
     
 def get_est(Img, prompt, t, iter=5):

@@ -224,7 +224,7 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
             squared_l2_conditional = (diff_conditional ** 2).sum(dim=(1, 2, 3))
             
             integrand_in_standard_integral = squared_l2_unconditional - squared_l2_conditional 
-            snr_diff = (batch_snr[1:] - batch_snr[:-1])
+            snr_diff = -1 * (batch_snr[1:] - batch_snr[:-1]) # multiply -1 to make positive
             snr_diff = snr_diff.unsqueeze(1)
             riemann_sum = integrand_in_standard_integral[1:] * snr_diff
             

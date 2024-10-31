@@ -548,14 +548,14 @@ def main():
             est_array = np.array(est_list)
             est_list_list.append(est_array)
             
-        # Save PMI for the current sample
-        torch.save(est_array, f'outputs/PMI_query_{opt.prompt}_sample_num_{sample_num}_iter_num_{iter_num}.pt')
-        print(f"PMI index {sample_num} finished.")
+            # Save PMI for the current sample
+            torch.save(est_array, f'outputs/PMI_query_{opt.prompt}_iter_num_{iter_num}_sample_num_{sample_num}.pt')
+            print(f"PMI index {sample_num} finished.")
 
-    # Convert the entire PMI list to a tensor and save
-    est_list_list_tensor = torch.tensor(est_list_list)
-    torch.save(est_list_list_tensor, f'outputs/PMI_query_{opt.prompt}_iter_num_{iter_num}.pt')
-    print("Saved PMI indices.")
+        # Convert the entire PMI list to a tensor and save
+        est_list_list_tensor = torch.tensor(est_list_list)
+        torch.save(est_list_list_tensor, f'outputs/PMI_query_{opt.prompt}_iter_num_{iter_num}.pt')
+        print("Saved PMI indices.")
 
 if __name__ == "__main__":
     main()

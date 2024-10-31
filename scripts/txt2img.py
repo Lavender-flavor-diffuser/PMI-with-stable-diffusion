@@ -199,6 +199,7 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
             nonEps = unet(
                 batch_x_t, original_t_values, encoder_hidden_states=uncond_embeddings
             ).sample
+            eps_comb = (1. + w) * eps - w * nonEps
             
             # Calculate coefficients
             alpha_bar_batch = alphas_bar[start_idx + t : end_idx + t + 1]
@@ -208,11 +209,11 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
             alpha_bar_from_t_batch_reshaped = alpha_bar_from_t_batch[:, None, None, None].to(torch.float32)
             
             coeff_lambda_inverse = torch.sqrt(1 / alpha_bar_from_t_batch_reshaped)
-            coeff_sigma_square = 1 - alpha_bar_from_t_batch_reshaped
+            coeff_sigma_square = (1 - alpha_bar_from_t_batch_reshaped)/ torch.sqrt(1 - alpha_bar_batch_reshaped)
             
             # Calculate mmse estimates of x_t
             x_hat_uncond = coeff_lambda_inverse * (batch_x_t + coeff_sigma_square * nonEps)
-            x_hat_cond = coeff_lambda_inverse * (batch_x_t + coeff_sigma_square * eps)
+            x_hat_cond = coeff_lambda_inverse * (batch_x_t + coeff_sigma_square * eps_comb)
             
             # Calculating standard integral
             latent_reshaped = latent[None, :, :, :]
@@ -521,9 +522,7 @@ def main():
     # PMI Calculation : time(51) * batch_size(--n_sample에 의해 조정) * Channel(4) * Height(64) * Width(64)
     est_list_list = []  # Stores PMI for all samples
 
-    for iter_num in range(opt.n_iter):
-        est_list = []  # Stores PMI for each sample
-        
+    for iter_num in range(opt.n_iter):        
         # Retrieve the intermediate dict for the current sample
         # 
         intermediate_dict = all_intermediates[iter_num]
@@ -533,6 +532,7 @@ def main():
         x_inter_list = intermediate_dict['x_inter']
         
         for sample_num in range(opt.n_samples):
+            est_list = []
             # Iterate over each intermediate tensor
             for time_idx, img_tensor in enumerate(x_inter_list):
                 print(f'current_time : {time_idx}')

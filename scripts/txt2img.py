@@ -272,7 +272,7 @@ def main():
     parser.add_argument(
         "--ddim_steps",
         type=int,
-        default=5, ## 나중에 20으로 수정해야함
+        default=20, ## 나중에 20으로 수정해야함
         help="number of ddim sampling steps",
     )
     parser.add_argument(

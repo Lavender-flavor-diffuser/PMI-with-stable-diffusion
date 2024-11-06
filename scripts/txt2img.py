@@ -209,8 +209,7 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w = 7.5):
             
             # We have to change the above value because stable diffusion normally use eps-prediction mode
             # So we have to convert eps to score function
-            classifier_free_eps = (1 + w) * conditional_eps - w * unconditional_eps
-            # classifier_free_eps = unconditional_eps + w * (conditional_eps - unconditional_eps)
+            classifier_free_eps = unconditional_eps + w * (conditional_eps - unconditional_eps)
             
             unconditional_score_function = - unconditional_eps / torch.sqrt(1 - alpha_bar_batch_reshaped)
             classifier_free_score_function = - classifier_free_eps / torch.sqrt(1 - alpha_bar_batch_reshaped)

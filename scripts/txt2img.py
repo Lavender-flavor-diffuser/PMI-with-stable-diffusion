@@ -115,17 +115,11 @@ def simulate_BM(x, gamma_list):
     z_gamma = gamma_list.view(-1, 1, 1, 1).to(x.device) * x + W_gamma
     return W_gamma, delta_W, z_gamma
 
-def get_intermediate_pointwise_mutual_info(latent, prompt, t, w = 7.5):
+def get_intermediate_pointwise_mutual_info(latent, classifier_free_eps, unconditional_eps, prompt, t, w = 7.5):
     # w : guidance strength (Stable diffusion normally use w = 7.5)
     with torch.no_grad():
         # Set device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Load Stable Diffusion components
-        model_id = "CompVis/stable-diffusion-v1-4"
-        unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(device)
-        tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-        text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
         
         # Initialize two terms
         standard_integral = 0.0
@@ -171,45 +165,6 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w = 7.5):
             
             alpha_bar_from_t_batch = alphas_bar_from_t[start_idx : end_idx + 1]
             alpha_bar_from_t_batch_reshaped = alpha_bar_from_t_batch[:, None, None, None].to(torch.float32)
-
-            # Original t values
-            original_t_values = torch.arange(start_idx + t, end_idx + t + 1, 1).to(device)
-
-            batch_size = batch_x_t.shape[0]
-
-            # Get text embeddings
-            text_inputs = tokenizer(
-                [prompt] * batch_size,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            text_embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
-
-            # For unconditional generation, create empty text embeddings
-            uncond_input = tokenizer(
-                [""] * batch_size,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
-
-            # Inference
-            # Conditional prediction
-            conditional_eps = unet(
-                batch_x_t, original_t_values, encoder_hidden_states=text_embeddings
-            ).sample
-            # Unconditional prediction
-            unconditional_eps = unet(
-                batch_x_t, original_t_values, encoder_hidden_states=uncond_embeddings
-            ).sample
-            
-            # We have to change the above value because stable diffusion normally use eps-prediction mode
-            # So we have to convert eps to score function
-            classifier_free_eps = unconditional_eps + w * (conditional_eps - unconditional_eps)
             
             unconditional_score_function = - unconditional_eps / torch.sqrt(1 - alpha_bar_batch_reshaped)
             classifier_free_score_function = - classifier_free_eps / torch.sqrt(1 - alpha_bar_batch_reshaped)
@@ -243,10 +198,10 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w = 7.5):
             ito_integral += (integrand_in_ito_integral * batch_delta_W).sum()
         return 0.5 * standard_integral, 0.5 * standard_integral + ito_integral
     
-def get_est(Img, prompt, t, iter=5):
+def get_est(latent, classifier_free_eps, unconditional_eps, prompt, t, iter=5):
     result = 0
     for _ in range(iter):
-        _, est = get_intermediate_pointwise_mutual_info(Img, prompt, t)
+        _, est = get_intermediate_pointwise_mutual_info(latent, classifier_free_eps, unconditional_eps, prompt, t)
         result += est
     return result/iter
 
@@ -354,7 +309,7 @@ def main():
     parser.add_argument(
         "--scale",
         type=float,
-        default=7.5,
+        default = 7.5,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
     parser.add_argument(
@@ -483,8 +438,6 @@ def main():
                         # Convert to NumPy array
                         est_array = np.array(est_cpu)
 
-                        print(f"est_array의 shape: {est_array.shape}")
-
                         ## Decoding Latent Representations to Images (이전까지는 latent space 상에서의 tensor)
                         x_samples_ddim = model.decode_first_stage(samples_ddim)
                         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
@@ -527,8 +480,6 @@ def main():
           f" \nEnjoy.")
 
     # PMI Calculation : time(51) * batch_size(--n_sample에 의해 조정) * Channel(4) * Height(64) * Width(64)
-    est_list_list = []  # Stores PMI for all samples
-
     for iter_num in range(opt.n_iter):        
         # Retrieve the intermediate dict for the current sample
         # 
@@ -537,32 +488,30 @@ def main():
         # Access the list of intermediate tensors
         # Replace 'x_inter' with the correct key if it's different
         x_inter_list = intermediate_dict['x_inter']
+        prediction_x = intermediate_dict['pred_x0'] # 특정 시점에서의 x (정확히는 latent) prediction을 저장
+        classifier_free_eps = intermediate_dict['classifier_free_eps']
+        unconditional_eps = intermediate_dict['unconditional_eps']
         
         for sample_num in range(opt.n_samples):
             est_list = []
             # Iterate over each intermediate tensor
-            for time_idx, img_tensor in enumerate(x_inter_list):
-                print(f'current_time : {time_idx}')
+            for time_idx in range(len(x_inter_list)):
                 if(time_idx == 0) : continue 
                 # Calculate the corresponding timestep
                 t = 1000 - time_idx * (1000 // opt.ddim_steps)
-                
+                current_latent_vector = x_inter_list[time_idx][sample_num]
+                current_classifier_free_eps = classifier_free_eps[time_idx - 1][sample_num]
+                current_unconditional_eps = unconditional_eps[time_idx - 1][sample_num]
                 # Call get_est with the correct arguments
-                est = get_est(img_tensor[sample_num], opt.prompt, t).cpu()
+                est = get_est(current_latent_vector, current_classifier_free_eps, current_unconditional_eps, opt.prompt, t).cpu()
                 est_list.append(est)
         
             # Convert est_list to a NumPy array and append to est_list_list
             est_array = np.array(est_list)
-            est_list_list.append(est_array)
             
             # Save PMI for the current sample
             torch.save(est_array, f'outputs/PMI_query_{opt.prompt}_iter_num_{iter_num}_sample_num_{sample_num}.pt')
             print(f"PMI index {sample_num} finished.")
-
-        # Convert the entire PMI list to a tensor and save
-        est_list_list_tensor = torch.tensor(est_list_list)
-        torch.save(est_list_list_tensor, f'outputs/PMI_query_{opt.prompt}_iter_num_{iter_num}.pt')
-        print("Saved PMI indices.")
 
 if __name__ == "__main__":
     main()

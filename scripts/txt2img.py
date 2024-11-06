@@ -103,7 +103,6 @@ def check_safety(x_image):
             x_checked_image[i] = load_replacement(x_checked_image[i])
     return x_checked_image, has_nsfw_concept
 
-
 def simulate_BM(x, gamma_list):
     # Given a data and list of snr, simulates a single Brownian motion path
     # z_gamma = gamma * x + W_gamma, W_gamma ~ N(0, gamma)
@@ -116,7 +115,8 @@ def simulate_BM(x, gamma_list):
     z_gamma = gamma_list.view(-1, 1, 1, 1).to(x.device) * x + W_gamma
     return W_gamma, delta_W, z_gamma
 
-def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
+def get_intermediate_pointwise_mutual_info(latent, prompt, t, w = 7.5):
+    # w : guidance strength (Stable diffusion normally use w = 7.5)
     with torch.no_grad():
         # Set device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -132,7 +132,7 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
         ito_integral = 0.0
 
         # Get alphas and betas from scheduler
-        betas = torch.linspace(1e-4, 0.028, 1000).double()
+        betas = torch.linspace(1e-4 ** 0.5, 0.02 ** 0.5, 1000, dtype = torch.float64) ** 2
         alphas = 1. - betas
         alphas_bar = torch.cumprod(alphas, dim = 0).to(device)
 
@@ -164,6 +164,13 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
             batch_snr = snrs[start_idx : end_idx + 1]
             batch_x_t = x_ts[start_idx : end_idx + 1]
             batch_delta_W = delta_Ws[start_idx : end_idx + 1]
+            
+            # Calculate coefficients
+            alpha_bar_batch = alphas_bar[start_idx + t : end_idx + t + 1]
+            alpha_bar_batch_reshaped = alpha_bar_batch[:, None, None, None, None].to(torch.float32)
+            
+            alpha_bar_from_t_batch = alphas_bar_from_t[start_idx : end_idx + 1]
+            alpha_bar_from_t_batch_reshaped = alpha_bar_from_t_batch[:, None, None, None].to(torch.float32)
 
             # Original t values
             original_t_values = torch.arange(start_idx + t, end_idx + t + 1, 1).to(device)
@@ -192,28 +199,29 @@ def get_intermediate_pointwise_mutual_info(latent, prompt, t, w=1.0):
 
             # Inference
             # Conditional prediction
-            eps = unet(
+            conditional_eps = unet(
                 batch_x_t, original_t_values, encoder_hidden_states=text_embeddings
             ).sample
             # Unconditional prediction
-            nonEps = unet(
+            unconditional_eps = unet(
                 batch_x_t, original_t_values, encoder_hidden_states=uncond_embeddings
             ).sample
-            eps_comb = (1. + w) * eps - w * nonEps
             
-            # Calculate coefficients
-            alpha_bar_batch = alphas_bar[start_idx + t : end_idx + t + 1]
-            alpha_bar_batch_reshaped = alpha_bar_batch[:, None, None, None, None].to(torch.float32)
+            # We have to change the above value because stable diffusion normally use eps-prediction mode
+            # So we have to convert eps to score function
+            classifier_free_eps = (1 + w) * conditional_eps - w * unconditional_eps
+            # classifier_free_eps = unconditional_eps + w * (conditional_eps - unconditional_eps)
             
-            alpha_bar_from_t_batch = alphas_bar_from_t[start_idx : end_idx + 1]
-            alpha_bar_from_t_batch_reshaped = alpha_bar_from_t_batch[:, None, None, None].to(torch.float32)
+            unconditional_score_function = - unconditional_eps / torch.sqrt(1 - alpha_bar_batch_reshaped)
+            classifier_free_score_function = - classifier_free_eps / torch.sqrt(1 - alpha_bar_batch_reshaped)
             
+            # Calculate coefficient in the integral
             coeff_lambda_inverse = torch.sqrt(1 / alpha_bar_from_t_batch_reshaped)
-            coeff_sigma_square = (1 - alpha_bar_from_t_batch_reshaped)/ torch.sqrt(1 - alpha_bar_batch_reshaped)
+            coeff_sigma_square = (1 - alpha_bar_from_t_batch_reshaped)
             
             # Calculate mmse estimates of x_t
-            x_hat_uncond = coeff_lambda_inverse * (batch_x_t + coeff_sigma_square * nonEps)
-            x_hat_cond = coeff_lambda_inverse * (batch_x_t + coeff_sigma_square * eps_comb)
+            x_hat_uncond = coeff_lambda_inverse * (batch_x_t + coeff_sigma_square * unconditional_score_function)
+            x_hat_cond = coeff_lambda_inverse * (batch_x_t + coeff_sigma_square * classifier_free_score_function)
             
             # Calculating standard integral
             latent_reshaped = latent[None, :, :, :]

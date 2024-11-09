@@ -159,8 +159,7 @@ class DDIMSampler(object):
             if index % log_every_t == 0 or index == total_steps - 1:
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
-                intermediates['classifier_free_eps'].append(e_t)
-                intermediates['unconditional_eps'].append(e_t_uncond)
+        
         return img, intermediates
 
     @torch.no_grad()

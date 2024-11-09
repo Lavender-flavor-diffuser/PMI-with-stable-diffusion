@@ -104,6 +104,9 @@ def check_safety(x_image):
     return x_checked_image, has_nsfw_concept
 
 def simulate_BM(x, gamma_list):
+    # gamma list : Storing SNR decreasing manner
+    # delta_W : linear variation in Browninan motion
+    # W_initial : initial value of Brownian motion i.e. W(0)
     # Given a data and list of snr, simulates a single Brownian motion path
     # z_gamma = gamma * x + W_gamma, W_gamma ~ N(0, gamma)
 
@@ -115,7 +118,7 @@ def simulate_BM(x, gamma_list):
     z_gamma = gamma_list.view(-1, 1, 1, 1).to(x.device) * x + W_gamma
     return W_gamma, delta_W, z_gamma
 
-def get_intermediate_pointwise_mutual_info(latent, classifier_free_eps, unconditional_eps, prompt, t, w = 7.5):
+def get_intermediate_pointwise_mutual_info(model, opt, latent, t, w = 7.5):
     # w : guidance strength (Stable diffusion normally use w = 7.5)
     with torch.no_grad():
         # Set device
@@ -132,7 +135,9 @@ def get_intermediate_pointwise_mutual_info(latent, classifier_free_eps, uncondit
 
         # alpha bar calculated from t (intermediate timestep)
         alphas_bar_from_t = torch.cumprod(alphas[t:], dim = 0).to(device)
+        
         # snr when we consider input at timestep t
+        # snrs[t'] = \frac{\overline \alpha_{[t: t']}}{1 - \overline \alpha_{[t: t']}
         snrs = alphas_bar_from_t / (1 - alphas_bar_from_t)
 
         # Simulate BM from t taking account of new snr values above
@@ -145,18 +150,20 @@ def get_intermediate_pointwise_mutual_info(latent, classifier_free_eps, uncondit
         # Compute x_t from z_gamma
         alphas_bar_from_t_reshaped = alphas_bar_from_t[:, None, None, None].to(torch.float32)
         z_gamma = z_gamma.to(torch.float32)
-        x_ts = z_gamma * (1 - alphas_bar_from_t_reshaped) / torch.sqrt(alphas_bar_from_t_reshaped)
+        x_from_t = z_gamma * (1 - alphas_bar_from_t_reshaped) / torch.sqrt(alphas_bar_from_t_reshaped)
 
         num_timesteps = 1000
         size = num_timesteps - t
         max_batch_size = 10  # Adjust as needed
 
-        for i in range((size - 1) // max_batch_size + 1):
+        # 전체 배치 수 계산
+        num_batches = (size - 1) // max_batch_size + 1
+        for i in tqdm(range(num_batches), desc="Processing Batches", unit="batch"):
             start_idx = i * max_batch_size
             end_idx = min((i + 1) * max_batch_size - 1, size - 1)
             # Truncate appropriately
             batch_snr = snrs[start_idx : end_idx + 1]
-            batch_x_t = x_ts[start_idx : end_idx + 1]
+            batch_x_t = x_from_t[start_idx : end_idx + 1]
             batch_delta_W = delta_Ws[start_idx : end_idx + 1]
             
             # Calculate coefficients
@@ -166,6 +173,14 @@ def get_intermediate_pointwise_mutual_info(latent, classifier_free_eps, uncondit
             alpha_bar_from_t_batch = alphas_bar_from_t[start_idx : end_idx + 1]
             alpha_bar_from_t_batch_reshaped = alpha_bar_from_t_batch[:, None, None, None].to(torch.float32)
             
+            original_t_values = torch.arange(start_idx + t, end_idx + t + 1, 1).to(device)
+            uc = model.get_learned_conditioning(max_batch_size * [""]).to(device)
+            c = model.get_learned_conditioning(max_batch_size * [opt.prompt]).to(device)
+            
+            conditional_eps = model.apply_model(batch_x_t, original_t_values, c)
+            unconditional_eps = model.apply_model(batch_x_t, original_t_values, uc)
+            classifier_free_eps = unconditional_eps + w * (conditional_eps - unconditional_eps)
+
             unconditional_score_function = - unconditional_eps / torch.sqrt(1 - alpha_bar_batch_reshaped)
             classifier_free_score_function = - classifier_free_eps / torch.sqrt(1 - alpha_bar_batch_reshaped)
             
@@ -198,10 +213,10 @@ def get_intermediate_pointwise_mutual_info(latent, classifier_free_eps, uncondit
             ito_integral += (integrand_in_ito_integral * batch_delta_W).sum()
         return 0.5 * standard_integral, 0.5 * standard_integral + ito_integral
     
-def get_est(latent, classifier_free_eps, unconditional_eps, prompt, t, iter=5):
+def get_est(model, opt, latent, t, iter=5):
     result = 0
     for _ in range(iter):
-        _, est = get_intermediate_pointwise_mutual_info(latent, classifier_free_eps, unconditional_eps, prompt, t)
+        _, est = get_intermediate_pointwise_mutual_info(model, opt, latent, t)
         result += est
     return result/iter
 
@@ -486,9 +501,6 @@ def main():
         # Access the list of intermediate tensors
         # Replace 'x_inter' with the correct key if it's different
         x_inter_list = intermediate_dict['x_inter']
-        prediction_x = intermediate_dict['pred_x0'] # 특정 시점에서의 x (정확히는 latent) prediction을 저장
-        classifier_free_eps = intermediate_dict['classifier_free_eps']
-        unconditional_eps = intermediate_dict['unconditional_eps']
         
         for sample_num in range(opt.n_samples):
             est_list = []
@@ -498,10 +510,8 @@ def main():
                 # Calculate the corresponding timestep
                 t = 1000 - time_idx * (1000 // opt.ddim_steps)
                 current_latent_vector = x_inter_list[time_idx][sample_num]
-                current_classifier_free_eps = classifier_free_eps[time_idx - 1][sample_num]
-                current_unconditional_eps = unconditional_eps[time_idx - 1][sample_num]
-                # Call get_est with the correct arguments
-                est = get_est(current_latent_vector, current_classifier_free_eps, current_unconditional_eps, opt.prompt, t).cpu()
+                # Call get_est with the correct arguments model
+                est = get_est(model, opt, current_latent_vector, t).cpu()
                 est_list.append(est)
         
             # Convert est_list to a NumPy array and append to est_list_list

@@ -106,9 +106,11 @@ def check_safety(x_image):
 def simulate_BM(x, gamma_list):
     # gamma list : Storing SNR decreasing manner
     # delta_W : linear variation in Browninan motion
+    #           delta_W ~ N(0, delta_gamma)
     # W_initial : initial value of Brownian motion i.e. W(0)
+    # W_gamma : W_t = W_{t - 1} + delta_W (전체 brownian path) [W_0, W_1, ..., W_T]
     # Given a data and list of snr, simulates a single Brownian motion path
-    # z_gamma = gamma * x + W_gamma, W_gamma ~ N(0, gamma)
+    # z_gamma = gamma * x + W_gamma, W_gamma ~ N(0, gamma) : 노이즈가 추가된 데이터 생성
 
     gamma_list = gamma_list.clone().detach().to(x.device)
     delta_gamma = torch.diff(gamma_list).to(x.device)
